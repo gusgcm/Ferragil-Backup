@@ -562,91 +562,76 @@ class FileCopierApp:
             entry.insert(0, directory)
 
     # ------------------------------------------------------------------
-    # Logica de copia (otimizada, thread-safe, sem chamadas Tkinter)
+    # Logica de copia (passagem unica, thread-safe, sem chamadas Tkinter)
     # ------------------------------------------------------------------
-    def count_files_to_copy(self, origem, destino):
-        """Conta arquivos novos ou modificados (sem os ja identicos no destino)."""
-        total_files = 0
+    @staticmethod
+    def _precisa_copiar(origem_path, destino_path):
+        """Retorna True se o arquivo de origem deve ser copiado para o destino.
+        Usa uma unica chamada os.stat por lado para minimizar I/O.
+        Regras:
+          - destino nao existe           -> copiar
+          - origem mais recente (> 1 s)  -> copiar
+          - caso contrario               -> nao copiar
+        """
         try:
-            for root, dirs, files in os.walk(origem):
-                rel_path = os.path.relpath(root, origem)
-                dest_root = os.path.join(destino, rel_path) if rel_path != '.' else destino
-                for arquivo in files:
-                    origem_path  = os.path.join(root, arquivo)
-                    destino_path = os.path.join(dest_root, arquivo)
-                    if not os.path.exists(destino_path):
-                        total_files += 1
-                    else:
-                        try:
-                            src_mtime  = os.path.getmtime(origem_path)
-                            dst_mtime  = os.path.getmtime(destino_path)
-                            # Copia apenas se a origem e mais recente (diferenca > 1 s)
-                            if src_mtime - dst_mtime > 1.0:
-                                total_files += 1
-                        except Exception:
-                            total_files += 1
-        except Exception as e:
-            print("Erro ao contar arquivos: {0}".format(e))
-        return total_files
+            src_st = os.stat(origem_path)
+        except OSError:
+            return False  # origem inacessivel; nao tenta copiar
+        try:
+            dst_st = os.stat(destino_path)
+        except OSError:
+            return True   # destino nao existe
+        return (src_st.st_mtime - dst_st.st_mtime) > 1.0
 
-    def copy_files_optimized(self, origem, destino, item, total_files_to_copy):
-        """Copia apenas arquivos novos ou modificados."""
-        if not os.path.exists(origem) or not os.path.isdir(origem):
+    def copy_files_singlepass(self, origem, destino, item):
+        """Percorre a origem UMA unica vez: verifica e copia na mesma passagem.
+        Nao ha pre-contagem; o progresso e atualizado a cada segundo (throttle
+        por tempo), o que evita sobrecarga de I/O em pastas com muitos arquivos.
+        Retorna o numero de arquivos copiados.
+        """
+        if not os.path.isdir(origem):
             self._status("Erro: Origem nao encontrada - {0}".format(origem), True)
             return 0
 
         files_copied  = 0
+        files_seen    = 0
         start_time    = time.time()
-        update_every  = max(1, total_files_to_copy // 50) if total_files_to_copy > 0 else 10
+        last_ui_time  = start_time  # throttle: atualiza UI no maximo 1x/s
 
         try:
             makedirs_compat(destino)
 
             for root, dirs, files in os.walk(origem):
+                if not self.copying:
+                    break
+
                 rel_path  = os.path.relpath(root, origem)
                 dest_root = os.path.join(destino, rel_path) if rel_path != '.' else destino
-                makedirs_compat(dest_root)
 
                 for arquivo in files:
                     if not self.copying:
                         return files_copied
 
-                    origem_path  = os.path.join(root, arquivo)
-                    destino_path = os.path.join(dest_root, arquivo)
+                    files_seen   += 1
+                    origem_path   = os.path.join(root, arquivo)
+                    destino_path  = os.path.join(dest_root, arquivo)
 
-                    precisa_copiar = False
-                    if not os.path.exists(destino_path):
-                        precisa_copiar = True
-                    else:
+                    if self._precisa_copiar(origem_path, destino_path):
                         try:
-                            src_mtime = os.path.getmtime(origem_path)
-                            dst_mtime = os.path.getmtime(destino_path)
-                            if src_mtime - dst_mtime > 1.0:
-                                precisa_copiar = True
-                            # Se igual ou destino mais recente: nao copiar
-                        except Exception:
-                            precisa_copiar = True
-
-                    if precisa_copiar:
-                        try:
-                            makedirs_compat(os.path.dirname(destino_path))
+                            makedirs_compat(dest_root)
                             shutil.copy2(origem_path, destino_path)
                             files_copied += 1
-
-                            if files_copied % update_every == 0 or files_copied == total_files_to_copy:
-                                if total_files_to_copy > 0:
-                                    pct     = (float(files_copied) / total_files_to_copy) * 100
-                                    elapsed = time.time() - start_time
-                                    if files_copied > 0 and elapsed > 0:
-                                        remaining = (elapsed / float(files_copied)) * (total_files_to_copy - files_copied)
-                                        mins, secs = divmod(int(remaining), 60)
-                                        time_str = "{0:02d}:{1:02d}".format(mins, secs)
-                                    else:
-                                        time_str = "--:--"
-                                    self._progress(item, pct, time_str, files_copied, total_files_to_copy)
-                                self._status("Copiando: {0}/{1} arquivos".format(files_copied, total_files_to_copy))
                         except Exception as e:
                             print("Erro ao copiar {0}: {1}".format(origem_path, e))
+
+                    # Atualiza UI no maximo 1x por segundo (throttle por tempo)
+                    now = time.time()
+                    if now - last_ui_time >= 1.0:
+                        last_ui_time = now
+                        elapsed = now - start_time
+                        self._progress(item, 0, "--:--", files_copied, files_seen)
+                        self._status("Copiando: {0} copiados / {1} verificados".format(
+                            files_copied, files_seen))
 
         except Exception as e:
             print("Erro geral na copia: {0}".format(e))
@@ -665,57 +650,44 @@ class FileCopierApp:
         if self.copying:
             return
 
-        self.copying = True
-        total_start  = time.time()
+        self.copying    = True
+        total_start     = time.time()
+        total_copied    = 0
 
         try:
-            self._status("Verificando arquivos para backup...")
-            file_counts         = {}
-            total_files_to_copy = 0
+            self._status("Iniciando backup...")
 
             for pair in self.directory_pairs:
-                if pair["source"] and pair["destination"]:
-                    count = self.count_files_to_copy(pair["source"], pair["destination"])
-                    file_counts[pair["item"]] = count
-                    total_files_to_copy += count
-                    self._progress(pair["item"], 0, "--:--", 0, count)
-
-            if total_files_to_copy == 0:
-                self._status("Nenhum arquivo novo ou modificado encontrado.")
-                if show_message:
-                    self._msginfo("Backup", "Nenhum arquivo novo ou modificado encontrado.")
-                return
-
-            self._status("Iniciando copia de {0} arquivo(s)...".format(total_files_to_copy))
-
-            total_copied = 0
-            for pair in self.directory_pairs:
-                if pair["source"] and pair["destination"] and self.copying:
-                    files_to_copy = file_counts.get(pair["item"], 0)
-                    if files_to_copy > 0:
-                        copied = self.copy_files_optimized(
-                            pair["source"],
-                            pair["destination"],
-                            pair["item"],
-                            files_to_copy
-                        )
-                        total_copied += copied
-                        self._progress(pair["item"], 100, "00:00", files_to_copy, files_to_copy)
+                if not self.copying:
+                    break
+                src = pair.get("source", "")
+                dst = pair.get("destination", "")
+                if src and dst:
+                    # Reseta visual do par antes de comecar
+                    self._progress(pair["item"], 0, "--:--", 0, 0)
+                    copied = self.copy_files_singlepass(src, dst, pair["item"])
+                    total_copied += copied
+                    # Marca par como concluido
+                    self._progress(pair["item"], 100, "00:00", copied, copied)
 
             # Registra horario do backup
             current_time = datetime.datetime.now().strftime("%H:%M")
             self.last_backup_date[current_time] = datetime.datetime.now().date()
 
             elapsed = time.time() - total_start
-            self._status("Backup concluido! {0} arquivos copiados em {1:.1f}s".format(total_copied, elapsed))
-            # Reseta barras de progresso via MSG_DONE
+            self._status("Backup concluido! {0} arquivo(s) copiado(s) em {1:.1f}s".format(
+                total_copied, elapsed))
             self._push(MSG_DONE, (total_copied, elapsed))
 
             if show_message:
-                self._msginfo(
-                    'Concluido',
-                    'Backup finalizado!\nArquivos copiados: {0}\nTempo: {1:.1f} segundos'.format(total_copied, elapsed)
-                )
+                if total_copied == 0:
+                    self._msginfo("Backup", "Nenhum arquivo novo ou modificado encontrado.")
+                else:
+                    self._msginfo(
+                        "Concluido",
+                        "Backup finalizado!\nArquivos copiados: {0}\nTempo: {1:.1f} segundos".format(
+                            total_copied, elapsed)
+                    )
 
         except Exception as e:
             self._status("Erro durante backup: {0}".format(str(e)[:60]), True)
