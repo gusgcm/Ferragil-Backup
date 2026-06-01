@@ -37,16 +37,14 @@ if not exist "FerragilBackup.pyw" (
     exit /b 1
 )
 
-REM Extrai o ICO embutido no script para usar como --icon do PyInstaller
-REM (define o icone visual do EXE no Explorer; em runtime o codigo usa o ICO embutido)
-echo Extraindo icone embutido...
-%PYTHON% -c "import base64; src=open('FerragilBackup.pyw').read(); s=src.find('_LOGO_ICO_B64 = \"')+len('_LOGO_ICO_B64 = \"'); e=src.find('\"',s); open('_tmp_logo.ico','wb').write(base64.b64decode(src[s:e]))"
-if exist "_tmp_logo.ico" (
-    echo Icone extraido.
-    set ICON_FLAG=--icon "_tmp_logo.ico"
+if exist "FerragilBackup.ico" (
+    echo Icone localizado: FerragilBackup.ico
+    set ICON_FLAG=--icon "FerragilBackup.ico"
+    set ADD_DATA_FLAG=--add-data "FerragilBackup.ico;."
 ) else (
-    echo [AVISO] Extracao falhou; EXE usara icone padrao.
+    echo [AVISO] FerragilBackup.ico nao encontrado; EXE usara icone padrao.
     set ICON_FLAG=
+    set ADD_DATA_FLAG=
 )
 
 echo Compilando...
@@ -56,6 +54,7 @@ echo Compilando...
     --windowed ^
     --noupx ^
     %ICON_FLAG% ^
+    %ADD_DATA_FLAG% ^
     --hidden-import=Tkinter ^
     --hidden-import=ttk ^
     --hidden-import=tkFileDialog ^
@@ -74,7 +73,6 @@ echo.
 if exist "dist\FerragilBackup.exe" (
     echo =======================================================
     echo  SUCESSO! dist\FerragilBackup.exe
-    echo  O EXE e autonomo - nenhum arquivo extra necessario.
     echo =======================================================
 ) else (
     echo =======================================================

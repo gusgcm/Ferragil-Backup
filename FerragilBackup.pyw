@@ -26,7 +26,7 @@ else:
     from collections import deque
     string_types = (str,)
 
-CONFIG_FILE = "config.json"
+CONFIG_APP_DIR = "FerragilBackup"
 COPY_BUFFER = 1024 * 1024
 
 MSG_PROGRESS = "progress"
@@ -62,12 +62,160 @@ def _get_app_dir():
         return os.getcwd()
 
 
-def _find_icon_path():
-    app_dir = _get_app_dir()
-    for name in ("FerragilBackup.ico", "logoF.ico", "icon.ico"):
-        p = os.path.join(app_dir, name)
-        if os.path.exists(p):
+def _get_real_exe_path():
+    if getattr(sys, 'frozen', False):
+        if hasattr(sys, '_MEIPASS'):
+            try:
+                return os.path.abspath(sys.argv[0])
+            except Exception:
+                pass
+        try:
+            return os.path.abspath(sys.executable)
+        except Exception:
+            pass
+    try:
+        return os.path.abspath(__file__)
+    except Exception:
+        return None
+
+
+def _query_appdata_from_registry():
+    try:
+        if PY2:
+            import _winreg as reg
+        else:
+            import winreg as reg
+        key = reg.OpenKey(
+            reg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
+        try:
+            val, _ = reg.QueryValueEx(key, 'AppData')
+        finally:
+            reg.CloseKey(key)
+        if val:
+            return val
+    except Exception:
+        pass
+    return None
+
+
+def _get_appdata_dir():
+    p = os.environ.get('APPDATA') or os.environ.get('appdata')
+    if p:
+        return p
+    p = _query_appdata_from_registry()
+    if p:
+        return p
+    try:
+        p = os.path.expandvars(r'%APPDATA%')
+        if p and p != r'%APPDATA%':
             return p
+    except Exception:
+        pass
+    try:
+        p = os.path.expanduser('~')
+        if p:
+            return p
+    except Exception:
+        pass
+    return os.getcwd()
+
+
+def _get_config_dir():
+    return os.path.join(_get_appdata_dir(), CONFIG_APP_DIR)
+
+
+def _get_config_path():
+    exe = _get_real_exe_path()
+    if exe:
+        return os.path.join(os.path.dirname(exe), 'config.json')
+    try:
+        return os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'config.json')
+    except Exception:
+        return 'config.json'
+
+
+def _to_utf8_bytes(s):
+    if PY2:
+        if isinstance(s, unicode):
+            return s.encode('utf-8')
+        try:
+            return s.decode('mbcs').encode('utf-8')
+        except Exception:
+            try:
+                return s.decode('utf-8').encode('utf-8')
+            except Exception:
+                return s
+    if isinstance(s, bytes):
+        return s
+    if isinstance(s, str):
+        return s.encode('utf-8')
+    return str(s).encode('utf-8')
+
+
+def _from_utf8_bytes(b):
+    if PY2:
+        try:
+            return b.decode('utf-8')
+        except Exception:
+            try:
+                return b.decode('mbcs')
+            except Exception:
+                return b
+    if isinstance(b, bytes):
+        return b.decode('utf-8')
+    return b
+
+
+def load_config_from_disk():
+    path = _get_config_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+        text = _from_utf8_bytes(raw)
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def save_config_to_disk(config):
+    path = _get_config_path()
+    try:
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        tmp_path = path + u".tmp"
+        payload = json.dumps(config, indent=4, ensure_ascii=False)
+        with open(tmp_path, 'wb') as f:
+            f.write(_to_utf8_bytes(payload))
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+        os.rename(tmp_path, path)
+        return True, path
+    except Exception as e:
+        return False, u"{0}: {1}".format(path, e)
+
+
+def _find_icon_path():
+    seen = set()
+    for base in (_get_app_dir(), _get_real_exe_path() and
+                 os.path.dirname(_get_real_exe_path() or "")):
+        if not base or base in seen:
+            continue
+        seen.add(base)
+        for name in ("FerragilBackup.ico", "logoF.ico", "icon.ico"):
+            p = os.path.join(base, name)
+            if os.path.isfile(p):
+                return p
     return None
 
 
@@ -417,12 +565,9 @@ class FileCopierApp:
             self.schedule_label.config(text="Nenhum horario programado")
 
     def load_config(self):
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, 'r') as f:
-                    self.config_data = json.load(f)
-            except Exception:
-                self.config_data = {}
+        data = load_config_from_disk()
+        if isinstance(data, dict):
+            self.config_data = data
         else:
             self.config_data = {}
         self.scheduled_times = self.config_data.get("scheduled_times", [])
@@ -435,11 +580,13 @@ class FileCopierApp:
         self.config_data["scheduled_times"] = self.scheduled_times
         self.config_data["automation"]       = bool(self.automation_var.get())
         self.config_data["systray"]          = bool(self.systray_var.get())
-        try:
-            with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.config_data, f, indent=4)
-        except Exception as e:
-            print("Erro ao salvar config: {0}".format(e))
+        ok, info = save_config_to_disk(self.config_data)
+        if not ok:
+            try:
+                self._status(
+                    u"ERRO salvando config: {0}".format(info), True)
+            except Exception:
+                pass
 
     def configurar_horarios(self):
         dialog = tk.Toplevel(self.master)
@@ -1032,11 +1179,10 @@ class FileCopierApp:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0,
                                  winreg.KEY_SET_VALUE)
             if enable:
-                exe_path = os.path.abspath(
-                    sys.executable if getattr(sys, 'frozen', False)
-                    else __file__)
-                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ,
-                                  '"' + exe_path + '"')
+                exe_path = _get_real_exe_path()
+                if exe_path:
+                    winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ,
+                                      '"' + exe_path + '"')
             else:
                 try:
                     winreg.DeleteValue(key, app_name)
